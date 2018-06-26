@@ -251,6 +251,7 @@ void DFHelper::print_header() {
 void DFHelper::prepare_sparsity() {
     // prep info vectors
     std::vector<double> shell_max_vals(pshells_ * pshells_, 0.0);
+    std::vector<double> aux_shell_max_vals(Qshells_, 0.0);
     std::vector<double> fun_max_vals(nao_ * nao_, 0.0);
     schwarz_shell_mask_.reserve(pshells_ * pshells_);
     schwarz_fun_mask_.reserve(nao_ * nao_);
@@ -310,17 +311,57 @@ void DFHelper::prepare_sparsity() {
         }
     }
 
-    // get screening tolerance
-    double tolerance = cutoff_ * cutoff_ / max_val;
+    // get max (A|A) for auxiliary basis set
 
+    std::shared_ptr<BasisSet> zero = BasisSet::zero_ao_basis_set();
+    auto aux_factory = std::make_shared<IntegralFactory>(aux_, zero, aux_, zero);
+    std::vector<std::shared_ptr<TwoBodyAOInt>> aux_eri(nthreads);
+    std::vector<const double*> aux_buffer(nthreads);
+
+    double aux_max_val = 0.0;
+#pragma omp parallel for private(rank) num_threads(nthreads) if (nao_ > 1000)
+    for (size_t i = 0; i < nthreads; i++) {
+#ifdef _OPENMP
+        rank = omp_get_thread_num();
+#endif
+        aux_eri[rank] = std::shared_ptr<TwoBodyAOInt>(aux_factory->eri());
+        aux_buffer[rank] = aux_eri[rank]->buffer();
+    }
+
+#pragma omp parallel for private(MU, NU, mu, nu, omu, onu, nummu, numnu, index, val, \
+        rank) num_threads(nthreads) if (nao_ > 1000) schedule(guided) reduction(max:max_val)
+    for (size_t A = 0; A < Qshells_; ++A) {
+#ifdef _OPENMP
+        rank = omp_get_thread_num();
+#endif
+        int numA = aux_->shell(A).nfunction();
+        aux_eri[rank]->compute_shell(A, 0, A, 0);
+
+        for (int a = 0; a < numA; ++a) {
+            val = std::fabs(aux_buffer[rank][a*numA+a]);
+            aux_max_val = std::max(val, aux_max_val);
+            if (aux_shell_max_vals[A] <= val) {
+                aux_shell_max_vals[A] = val;
+            }
+        }
+    }
+
+
+    // get screening tolerance ... this formula ignored (A|A) part, so replacing it -CDS
+    // double tolerance = cutoff_ * cutoff_ / max_val;
+
+    double sqrt_aux_max_val = sqrt(aux_max_val);
     //#pragma omp parallel for simd num_threads(nthreads_) schedule(static)
-    for (size_t i = 0; i < pshells_ * pshells_; i++) schwarz_shell_mask_[i] = (shell_max_vals[i] < tolerance ? 0 : 1);
+    for (size_t i = 0; i < pshells_ * pshells_; i++) {
+        double max_int = sqrt(shell_max_vals[i]) * sqrt_aux_max_val;
+        schwarz_shell_mask_[i] = (max_int < cutoff_ ? 0 : 1);
+    }
 
     //#pragma omp parallel for private(count) num_threads(nthreads_)
     for (size_t i = 0, count = 0; i < nao_; i++) {
         count = 0;
         for (size_t j = 0; j < nao_; j++) {
-            if (fun_max_vals[i * nao_ + j] >= tolerance) {
+            if (sqrt(fun_max_vals[i * nao_ + j])*sqrt_aux_max_val >= cutoff_) {
                 count++;
                 schwarz_fun_mask_[i * nao_ + j] = count;
             } else
